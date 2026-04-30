@@ -1,0 +1,16 @@
+---
+# Feature flag configmap. The investigator opens PRs against this file when an
+# SLO burn-rate alert fires. The CronJob `flag-flipper` toggles this every 6h to
+# reproduce the cascading-failure scenario.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lumen-flags
+  namespace: slo-demo
+  labels:
+    app: lumen
+data:
+  flags.json: |
+    {
+      "enableDynamicPanels": false
+    }

@@ -1,6 +1,8 @@
 """Investigator webhook.
 
-Receives a Grafana alert webhook. On a firing SLO burn-rate alert, it:
+Receives a Grafana alert webhook (per
+https://grafana.com/docs/grafana/latest/alerting/configure-notifications/manage-contact-points/integrations/webhook-notifier/).
+On a firing SLO burn-rate alert, it:
 
   1. Triggers a Sift investigation via the Grafana ML / Sift API.
   2. Polls for completion and reads top analyses.
@@ -12,6 +14,9 @@ Required env:
   GITHUB_TOKEN    PAT with repo scope (mounted from investigator-secrets)
   GRAFANA_URL     Grafana stack URL (e.g. https://stephenwagner.grafana.net)
   GRAFANA_TOKEN   Grafana service account token
+
+If a token is missing, the relevant step is skipped and the response notes which
+external action ran in dry-run mode — useful for local testing.
 """
 from __future__ import annotations
 
@@ -21,13 +26,14 @@ import time
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from github import Auth, Github
 
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "stephenwagner-grafana/slo-demo")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "").rstrip("/")
 GRAFANA_TOKEN = os.environ.get("GRAFANA_TOKEN", "")
+WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 CONFIGMAP_PATH = os.environ.get("CONFIGMAP_PATH", "manifests/configmap-flags.yaml")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,6 +48,8 @@ def healthz():
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    if WEBHOOK_TOKEN and request.headers.get("X-Webhook-Token") != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
     payload = await request.json()
     status = payload.get("status", "unknown")
     log.info("alert webhook: status=%s alerts=%d", status, len(payload.get("alerts", [])))
@@ -56,8 +64,12 @@ async def webhook(request: Request):
     return {"action": "investigated", "sift": sift, "pr": pr, "issue": issue}
 
 
+def _is_real_token(value: str) -> bool:
+    return bool(value) and not value.lower().startswith("placeholder")
+
+
 async def run_sift_investigation(payload: dict[str, Any]) -> dict[str, Any]:
-    if not (GRAFANA_URL and GRAFANA_TOKEN):
+    if not (GRAFANA_URL and _is_real_token(GRAFANA_TOKEN)):
         log.info("Sift: dry-run (GRAFANA_URL/GRAFANA_TOKEN not set)")
         return {"mode": "dry-run", "summary": fallback_summary(payload)}
 
@@ -67,32 +79,37 @@ async def run_sift_investigation(payload: dict[str, Any]) -> dict[str, Any]:
         "labels": {"namespace": "slo-demo", "demo": "slo-investigation"},
         "requestData": {"checks": ["ErrorPatternLogCheck", "SlowRequestsCheck"]},
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            f"{GRAFANA_URL}/api/plugins/grafana-ml-app/resources/sift/api/v1/investigations",
-            headers=headers,
-            json=body,
-        )
-        r.raise_for_status()
-        inv = r.json()
-        inv_id = inv.get("id") or inv.get("data", {}).get("id")
-
-        for _ in range(30):
-            time.sleep(5)
-            s = await client.get(
-                f"{GRAFANA_URL}/api/plugins/grafana-ml-app/resources/sift/api/v1/investigations/{inv_id}",
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{GRAFANA_URL}/api/plugins/grafana-ml-app/resources/sift/api/v1/investigations",
                 headers=headers,
+                json=body,
             )
-            data = s.json()
-            if data.get("status") == "finished":
-                break
+            r.raise_for_status()
+            inv = r.json()
+            inv_id = inv.get("id") or inv.get("data", {}).get("id")
 
-        return {
-            "mode": "live",
-            "id": inv_id,
-            "url": f"{GRAFANA_URL}/a/grafana-ml-app/sift/investigations/{inv_id}",
-            "summary": data.get("summary", fallback_summary(payload)),
-        }
+            data: dict[str, Any] = {}
+            for _ in range(30):
+                time.sleep(5)
+                s = await client.get(
+                    f"{GRAFANA_URL}/api/plugins/grafana-ml-app/resources/sift/api/v1/investigations/{inv_id}",
+                    headers=headers,
+                )
+                data = s.json()
+                if data.get("status") == "finished":
+                    break
+
+            return {
+                "mode": "live",
+                "id": inv_id,
+                "url": f"{GRAFANA_URL}/a/grafana-ml-app/sift/investigations/{inv_id}",
+                "summary": data.get("summary", fallback_summary(payload)),
+            }
+    except Exception as e:
+        log.warning("Sift call failed (%s); falling back to canned summary", e)
+        return {"mode": "fallback", "error": str(e), "summary": fallback_summary(payload)}
 
 
 def fallback_summary(payload: dict[str, Any]) -> str:
@@ -108,7 +125,7 @@ def fallback_summary(payload: dict[str, Any]) -> str:
 
 
 async def open_rollback_pr(sift: dict[str, Any]) -> dict[str, Any]:
-    if not GITHUB_TOKEN:
+    if not _is_real_token(GITHUB_TOKEN):
         log.info("GitHub: dry-run (no GITHUB_TOKEN)")
         return {"mode": "dry-run", "title": "Revert enableDynamicPanels — Firefox regression"}
 
@@ -152,7 +169,7 @@ async def open_rollback_pr(sift: dict[str, Any]) -> dict[str, Any]:
 
 
 async def open_tracking_issue(sift: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any]:
-    if not GITHUB_TOKEN:
+    if not _is_real_token(GITHUB_TOKEN):
         log.info("GitHub issue: dry-run")
         return {"mode": "dry-run", "title": "Firefox compatibility for dynamic panels"}
 

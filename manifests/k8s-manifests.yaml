@@ -369,6 +369,9 @@ spec:
             - name: GRAFANA_TOKEN
               valueFrom:
                 secretKeyRef: { name: investigator-secrets, key: GRAFANA_TOKEN, optional: true }
+            - name: WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef: { name: investigator-secrets, key: WEBHOOK_TOKEN, optional: true }
           ports: [{ containerPort: 8080, name: http }]
           volumeMounts:
             - { name: src, mountPath: /src }
@@ -387,3 +390,44 @@ spec:
   selector: { app: investigator }
   ports:
     - { name: http, port: 8080, targetPort: 8080 }
+---
+# Ingress so Grafana Cloud alert webhooks can reach the investigator.
+# Auth is enforced in-app via the WEBHOOK_TOKEN shared secret.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: investigator
+  namespace: slo-demo
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: slo-investigator.wombatwags.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: investigator
+                port:
+                  number: 8080
+---
+# Frontend ingress so the demo Lumen Analytics site is viewable from the browser.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: slo-demo
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: lumen.wombatwags.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

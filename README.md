@@ -37,27 +37,67 @@ a Chromium-only API.
 
 Requires:
 - A k3s/k8s cluster
-- `grafana-cloud-credentials` secret in the `fake-shop` namespace — `deploy.sh`
+- `grafana-cloud-credentials` secret in the `fake-shop` namespace (see
+  [Grafana Cloud creds spec](#grafana-cloud-credentials-format)) — `deploy.sh`
   copies it into `slo-demo`.
 
 ```bash
 ./deploy.sh
 ```
 
-Then populate the investigator secret:
+Then populate the investigator secret. `WEBHOOK_TOKEN` is a shared secret the
+Grafana contact point sends in the `X-Webhook-Token` header:
 
 ```bash
+WEBHOOK_TOKEN=$(openssl rand -hex 24)
 kubectl create secret generic investigator-secrets -n slo-demo \
   --from-literal=GITHUB_TOKEN=ghp_xxx \
   --from-literal=GRAFANA_URL=https://yourstack.grafana.net \
   --from-literal=GRAFANA_TOKEN=glsa_xxx \
+  --from-literal=WEBHOOK_TOKEN="$WEBHOOK_TOKEN" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
+
+## Wire the alert to the investigator
+
+The alert rule (`Lumen Page Load Burn Rate`, UID `ffklwrcpdmdq8d`) lives in
+Grafana Cloud. To create the webhook contact point and route the alert there:
+
+```bash
+export GRAFANA_URL=https://yourstack.grafana.net
+export GRAFANA_TOKEN=glsa_xxx        # service-account token with alerting:write
+./scripts/setup-contact-point.sh
+```
+
+This creates the `slo-demo-investigator` contact point and sets the alert's
+notification settings to use it. It pulls the shared webhook secret from the
+in-cluster `investigator-secrets`.
 
 ## Manual flag toggle
 
 ```bash
+# turn on (triggers the cascade)
 kubectl patch configmap lumen-flags -n slo-demo --type merge \
   -p '{"data":{"flags.json":"{\n  \"enableDynamicPanels\": true\n}\n"}}'
 kubectl rollout restart deployment/middleware -n slo-demo
+```
+
+## Grafana Cloud credentials format
+
+The secret in `fake-shop` is shaped like:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-cloud-credentials
+type: Opaque
+stringData:
+  GRAFANA_CLOUD_API_KEY:         glc_...
+  GRAFANA_CLOUD_INSTANCE_ID:     "1372178"
+  GRAFANA_CLOUD_LOKI_URL:        https://logs-prod-036.grafana.net/loki/api/v1/push
+  GRAFANA_CLOUD_LOKI_USER:       "1329972"
+  GRAFANA_CLOUD_OTLP_ENDPOINT:   https://otlp-gateway-prod-us-east-2.grafana.net/otlp
+  GRAFANA_CLOUD_PROMETHEUS_URL:  https://prometheus-prod-56-prod-us-east-2.grafana.net/api/prom/push
+  GRAFANA_CLOUD_PROMETHEUS_USER: "2668591"
 ```

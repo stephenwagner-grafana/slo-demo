@@ -1,0 +1,214 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: slo-demo
+data:
+  config.alloy: |
+    // ============================================================
+    // Alloy config — slo-demo namespace
+    // Receives OTLP traces/logs/metrics from middleware,
+    // scrapes Prometheus from middleware + postgres-exporter,
+    // tails pod logs, ships everything to Grafana Cloud.
+    // ============================================================
+
+    // --- Remote-write endpoints --------------------------------------------
+    prometheus.remote_write "grafana_cloud" {
+      endpoint {
+        url = env("GRAFANA_CLOUD_PROMETHEUS_URL")
+        basic_auth {
+          username = env("GRAFANA_CLOUD_PROMETHEUS_USER")
+          password = env("GRAFANA_CLOUD_API_KEY")
+        }
+      }
+      external_labels = {
+        cluster = "k3s",
+        env     = "demo",
+        service = "slo-demo",
+      }
+    }
+
+    loki.write "grafana_cloud" {
+      endpoint {
+        url = env("GRAFANA_CLOUD_LOKI_URL")
+        basic_auth {
+          username = env("GRAFANA_CLOUD_LOKI_USER")
+          password = env("GRAFANA_CLOUD_API_KEY")
+        }
+      }
+      external_labels = {
+        cluster = "k3s",
+        env     = "demo",
+        service = "slo-demo",
+      }
+    }
+
+    otelcol.auth.basic "grafana_cloud" {
+      username = env("GRAFANA_CLOUD_INSTANCE_ID")
+      password = env("GRAFANA_CLOUD_API_KEY")
+    }
+
+    otelcol.exporter.otlphttp "grafana_cloud" {
+      client {
+        endpoint = env("GRAFANA_CLOUD_OTLP_ENDPOINT")
+        auth     = otelcol.auth.basic.grafana_cloud.handler
+      }
+    }
+
+    // --- OTLP receiver (middleware traces + metrics + logs) -----------------
+    otelcol.receiver.otlp "default" {
+      grpc { endpoint = "0.0.0.0:4317" }
+      http { endpoint = "0.0.0.0:4318" }
+      output {
+        traces  = [otelcol.processor.batch.default.input]
+        metrics = [otelcol.processor.batch.default.input]
+        logs    = [otelcol.processor.batch.default.input]
+      }
+    }
+
+    otelcol.processor.batch "default" {
+      output {
+        traces  = [otelcol.exporter.otlphttp.grafana_cloud.input]
+        metrics = [otelcol.exporter.otlphttp.grafana_cloud.input]
+        logs    = [otelcol.exporter.otlphttp.grafana_cloud.input]
+      }
+    }
+
+    // --- Prometheus scrape: middleware /metrics ----------------------------
+    prometheus.scrape "middleware" {
+      targets = [{
+        "__address__" = "middleware.slo-demo.svc.cluster.local:8000",
+        "job"         = "slo-demo/middleware",
+      }]
+      forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+      scrape_interval = "15s"
+      metrics_path    = "/metrics"
+    }
+
+    // --- Prometheus scrape: postgres-exporter ------------------------------
+    prometheus.scrape "postgres" {
+      targets = [{
+        "__address__" = "postgres.slo-demo.svc.cluster.local:9187",
+        "job"         = "slo-demo/postgres",
+      }]
+      forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+      scrape_interval = "15s"
+    }
+
+    // --- Pod logs from slo-demo namespace ----------------------------------
+    discovery.kubernetes "pods" {
+      role = "pod"
+      namespaces { names = ["slo-demo"] }
+    }
+
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+    }
+
+    loki.source.kubernetes "pods" {
+      targets    = discovery.relabel.pods.output
+      forward_to = [loki.write.grafana_cloud.receiver]
+    }
+
+    // --- Alloy self-metrics ------------------------------------------------
+    prometheus.scrape "alloy_self" {
+      targets         = [{"__address__" = "localhost:12345", "job" = "slo-demo/alloy"}]
+      forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+      scrape_interval = "60s"
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: slo-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy-slo-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy-slo-demo
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: slo-demo
+roleRef:
+  kind: ClusterRole
+  name: alloy-slo-demo
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alloy
+  namespace: slo-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: alloy }
+  template:
+    metadata:
+      labels: { app: alloy }
+    spec:
+      serviceAccountName: alloy
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.12.0
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --storage.path=/var/lib/alloy/data
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --stability.level=public-preview
+          ports:
+            - { containerPort: 12345, name: http }
+            - { containerPort: 4317,  name: otlp-grpc }
+            - { containerPort: 4318,  name: otlp-http }
+          envFrom:
+            - secretRef: { name: grafana-cloud-credentials }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alloy/config.alloy, subPath: config.alloy }
+            - { name: data,   mountPath: /var/lib/alloy/data }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+      volumes:
+        - { name: config, configMap: { name: alloy-config } }
+        - { name: data,   emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy
+  namespace: slo-demo
+spec:
+  selector: { app: alloy }
+  ports:
+    - { name: http,      port: 12345, targetPort: 12345 }
+    - { name: otlp-grpc, port: 4317,  targetPort: 4317 }
+    - { name: otlp-http, port: 4318,  targetPort: 4318 }

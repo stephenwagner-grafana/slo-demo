@@ -1,0 +1,389 @@
+---
+# =============================================================================
+# Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slo-demo
+  labels:
+    demo: slo-investigation
+    purpose: se-demo
+---
+# =============================================================================
+# Feature flag ConfigMap (the "config under change" — investigator PRs against this)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lumen-flags
+  namespace: slo-demo
+  labels:
+    app: lumen
+data:
+  flags.json: |
+    {
+      "enableDynamicPanels": false
+    }
+---
+# =============================================================================
+# Postgres (init.sql configmap is created by deploy.sh from --from-file)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: slo-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER,     value: lumen }
+            - { name: POSTGRES_PASSWORD, value: lumen }
+            - { name: POSTGRES_DB,       value: lumen }
+            - { name: PGDATA,            value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - { name: data,    mountPath: /var/lib/postgresql/data }
+            - { name: init,    mountPath: /docker-entrypoint-initdb.d }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          env:
+            - name: DATA_SOURCE_NAME
+              value: "postgresql://lumen:lumen@localhost:5432/lumen?sslmode=disable"
+          ports:
+            - { containerPort: 9187, name: metrics }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 128Mi }
+      volumes:
+        - { name: data, emptyDir: {} }
+        - { name: init, configMap: { name: postgres-init } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: slo-demo
+  labels:
+    app: postgres
+spec:
+  selector: { app: postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+    - { name: metrics,  port: 9187, targetPort: 9187 }
+---
+# =============================================================================
+# Middleware (Python FastAPI; src configmap from --from-file)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: middleware
+  namespace: slo-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: middleware }
+  template:
+    metadata:
+      labels: { app: middleware }
+    spec:
+      containers:
+        - name: middleware
+          image: python:3.11-slim
+          workingDir: /app
+          command: ["sh", "-c"]
+          args:
+            - |
+              cp /src/* /app/
+              pip install --quiet --no-cache-dir -r requirements.txt
+              exec uvicorn app:app --host 0.0.0.0 --port 8000
+          env:
+            - { name: OTEL_SERVICE_NAME,                value: lumen-middleware }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT,      value: "http://alloy.slo-demo.svc.cluster.local:4317" }
+            - { name: OTEL_EXPORTER_OTLP_PROTOCOL,      value: grpc }
+            - { name: OTEL_EXPORTER_OTLP_INSECURE,      value: "true" }
+            - { name: PG_DSN,                           value: "postgresql://lumen:lumen@postgres.slo-demo.svc.cluster.local:5432/lumen" }
+            - { name: FLAGS_FILE,                       value: /etc/flags/flags.json }
+          ports:
+            - { containerPort: 8000, name: http }
+          volumeMounts:
+            - { name: src,   mountPath: /src }
+            - { name: flags, mountPath: /etc/flags }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+      volumes:
+        - { name: src,   configMap: { name: middleware-src } }
+        - { name: flags, configMap: { name: lumen-flags } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: middleware
+  namespace: slo-demo
+  labels:
+    app: middleware
+spec:
+  selector: { app: middleware }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+---
+# =============================================================================
+# Frontend (nginx; static files configmap from --from-file + nginx.conf inline)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-nginx
+  namespace: slo-demo
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /var/log/nginx/error.log warn;
+    pid /tmp/nginx.pid;
+    events { worker_connections 1024; }
+    http {
+      include /etc/nginx/mime.types;
+      default_type application/octet-stream;
+      sendfile on;
+      keepalive_timeout 65;
+      log_format timed '$remote_addr - $remote_user [$time_local] '
+                       '"$request" $status $body_bytes_sent '
+                       '"$http_referer" "$http_user_agent" rt=$request_time';
+      access_log /var/log/nginx/access.log timed;
+      server {
+        listen 80;
+        root /usr/share/nginx/html;
+        index index.html;
+        location / { try_files $uri $uri/ =404; }
+        location /api/ {
+          proxy_pass http://middleware.slo-demo.svc.cluster.local:8000;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: slo-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: frontend }
+  template:
+    metadata:
+      labels: { app: frontend }
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports: [{ containerPort: 80 }]
+          volumeMounts:
+            - { name: nginx, mountPath: /etc/nginx/nginx.conf,                     subPath: nginx.conf }
+            - { name: html,  mountPath: /usr/share/nginx/html/index.html,          subPath: index.html }
+            - { name: html,  mountPath: /usr/share/nginx/html/products.html,       subPath: products.html }
+            - { name: html,  mountPath: /usr/share/nginx/html/reports.html,        subPath: reports.html }
+            - { name: html,  mountPath: /usr/share/nginx/html/search.html,         subPath: search.html }
+            - { name: css,   mountPath: /usr/share/nginx/html/css/styles.css,      subPath: styles.css }
+            - { name: js,    mountPath: /usr/share/nginx/html/js/app.js,            subPath: app.js }
+            - { name: js,    mountPath: /usr/share/nginx/html/js/dynamic-panels.js, subPath: dynamic-panels.js }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - { name: nginx, configMap: { name: frontend-nginx } }
+        - { name: html,  configMap: { name: frontend-html } }
+        - { name: css,   configMap: { name: frontend-css } }
+        - { name: js,    configMap: { name: frontend-js } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: slo-demo
+  labels:
+    app: frontend
+spec:
+  selector: { app: frontend }
+  ports:
+    - { name: http, port: 80, targetPort: 80 }
+---
+# =============================================================================
+# Loadgen (configmap from --from-file)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: slo-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: loadgen }
+  template:
+    metadata:
+      labels: { app: loadgen }
+    spec:
+      containers:
+        - name: loadgen
+          image: python:3.11-slim
+          command: ["python3", "/src/loadgen.py"]
+          env:
+            - { name: FRONTEND_URL,   value: "http://frontend.slo-demo.svc.cluster.local" }
+            - { name: MIDDLEWARE_URL, value: "http://middleware.slo-demo.svc.cluster.local:8000" }
+            - { name: RPS,            value: "5" }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - { name: src, configMap: { name: loadgen-src } }
+---
+# =============================================================================
+# Flag-flip CronJob (every 6h, UTC-aligned: 00, 06, 12, 18)
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flag-flipper
+  namespace: slo-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flag-flipper
+  namespace: slo-demo
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["lumen-flags"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["middleware"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flag-flipper
+  namespace: slo-demo
+subjects:
+  - kind: ServiceAccount
+    name: flag-flipper
+    namespace: slo-demo
+roleRef:
+  kind: Role
+  name: flag-flipper
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: flag-flipper
+  namespace: slo-demo
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: flag-flipper
+          restartPolicy: OnFailure
+          containers:
+            - name: kubectl
+              image: bitnami/kubectl:1.30
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  current=$(kubectl get configmap lumen-flags -n slo-demo \
+                    -o jsonpath='{.data.flags\.json}' | grep -oE 'true|false' | head -1)
+                  if [ "$current" = "true" ]; then next=false; else next=true; fi
+                  echo "Flipping enableDynamicPanels: $current -> $next"
+                  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                  kubectl patch configmap lumen-flags -n slo-demo --type=merge -p "{\"data\":{\"flags.json\":\"{\\n  \\\"enableDynamicPanels\\\": ${next}\\n}\\n\"},\"metadata\":{\"annotations\":{\"slo-demo.flipped-at\":\"${ts}\",\"slo-demo.flipped-to\":\"${next}\"}}}"
+                  kubectl rollout restart deployment/middleware -n slo-demo
+                  echo "Flag flipped to ${next} at ${ts}."
+---
+# =============================================================================
+# Investigator webhook service (alert -> Sift -> GitHub PR + issue)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: investigator
+  namespace: slo-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: investigator }
+  template:
+    metadata:
+      labels: { app: investigator }
+    spec:
+      containers:
+        - name: investigator
+          image: python:3.11-slim
+          workingDir: /app
+          command: ["sh", "-c"]
+          args:
+            - |
+              cp /src/* /app/
+              pip install --quiet --no-cache-dir -r requirements.txt
+              exec uvicorn app:app --host 0.0.0.0 --port 8080
+          env:
+            - { name: GITHUB_REPO, value: "stephenwagner-grafana/slo-demo" }
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef: { name: investigator-secrets, key: GITHUB_TOKEN, optional: true }
+            - name: GRAFANA_URL
+              valueFrom:
+                secretKeyRef: { name: investigator-secrets, key: GRAFANA_URL, optional: true }
+            - name: GRAFANA_TOKEN
+              valueFrom:
+                secretKeyRef: { name: investigator-secrets, key: GRAFANA_TOKEN, optional: true }
+          ports: [{ containerPort: 8080, name: http }]
+          volumeMounts:
+            - { name: src, mountPath: /src }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { cpu: 300m, memory: 256Mi }
+      volumes:
+        - { name: src, configMap: { name: investigator-src } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: investigator
+  namespace: slo-demo
+spec:
+  selector: { app: investigator }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
